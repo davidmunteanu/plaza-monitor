@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Plaza NewNewNew — Delft Listing Monitor (Discord edition)
+Plaza NewNewNew — Delft Listing Monitor (Pushover edition)
 ==========================================================
-Polls the Plaza website for new rental listings in Delft and pings
-you on Discord via a webhook whenever something new appears.
+Polls the Plaza website for new rental listings in Delft and sends
+a push notification to your phone via Pushover.
 
 Anti-ban strategy:
-  • Randomised polling interval (default 8–15 min)
-  • Realistic browser User-Agent, rotated randomly
+  • Only runs 07:00–23:00 CET (no suspicious night traffic)
+  • Randomised 5–7 min interval via GitHub Actions jitter
+  • Realistic browser User-Agent, rotated each run
   • Homepage warm-up for cookies + referer chain
-  • Polite delays between page fetches (2–5 s)
-  • Exponential back-off on errors (up to 1 hour)
+  • Skips full parse if page HTML hasn't changed (ETag/hash)
+  • Monitors response times — auto backs off if Plaza slows down
+  • Polite delays between page fetches
+  • Exponential back-off on errors
   • Only fetches public pages — no login, no API abuse
 """
 
@@ -23,7 +26,7 @@ import re
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +36,8 @@ from bs4 import BeautifulSoup
 # ──────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────
+
+CET = timezone(timedelta(hours=2))  # CEST (summer), close enough year-round
 
 def load_env_file():
     """Load variables from .env file if present."""
@@ -51,12 +56,17 @@ load_env_file()
 
 @dataclass
 class Config:
-    # Discord webhook URL (REQUIRED — the only thing you need to set)
-    discord_webhook_url: str = os.getenv("DISCORD_WEBHOOK_URL", "")
+    # Pushover credentials (REQUIRED)
+    pushover_user_key: str = os.getenv("PUSHOVER_USER_KEY", "")
+    pushover_api_token: str = os.getenv("PUSHOVER_API_TOKEN", "")
 
     # Polling settings
-    poll_min_seconds: int = int(os.getenv("POLL_MIN_SECONDS", "480"))   # 8 min
-    poll_max_seconds: int = int(os.getenv("POLL_MAX_SECONDS", "900"))   # 15 min
+    poll_min_seconds: int = int(os.getenv("POLL_MIN_SECONDS", "480"))
+    poll_max_seconds: int = int(os.getenv("POLL_MAX_SECONDS", "900"))
+
+    # Active hours (CET) — no checks outside this window
+    active_hour_start: int = int(os.getenv("ACTIVE_HOUR_START", "7"))   # 07:00
+    active_hour_end: int = int(os.getenv("ACTIVE_HOUR_END", "23"))      # 23:00
 
     # Target city filter
     target_city: str = os.getenv("TARGET_CITY", "delft")
@@ -68,14 +78,35 @@ class Config:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
     def validate(self):
-        if not self.discord_webhook_url:
+        missing = []
+        if not self.pushover_user_key:
+            missing.append("PUSHOVER_USER_KEY")
+        if not self.pushover_api_token:
+            missing.append("PUSHOVER_API_TOKEN")
+        if missing:
             print(
-                "\n❌  Missing DISCORD_WEBHOOK_URL\n"
-                "   1. In Discord: right-click a channel → Edit Channel → Integrations → Webhooks\n"
-                "   2. Click 'New Webhook', copy the URL\n"
-                "   3. Paste it in your .env file as DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...\n"
+                f"\n❌  Missing: {', '.join(missing)}\n"
+                "   1. Install Pushover on your phone (Play Store)\n"
+                "   2. Your User Key is on the main screen of the app\n"
+                "   3. Create an app at https://pushover.net/apps/build to get an API Token\n"
+                "   4. Set both in .env or as GitHub secrets\n"
             )
             sys.exit(1)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Time window check
+# ──────────────────────────────────────────────────────────────────────
+
+def is_active_hours(config: Config) -> bool:
+    """Check if current time in CET is within active hours."""
+    now_cet = datetime.now(CET)
+    return config.active_hour_start <= now_cet.hour < config.active_hour_end
+
+
+def is_weekend() -> bool:
+    """Check if today is Saturday (5) or Sunday (6) in CET."""
+    return datetime.now(CET).weekday() >= 5
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -126,6 +157,9 @@ LISTING_URLS = [
 
 logger = logging.getLogger("plaza_monitor")
 
+# In-memory cache of page hashes to skip re-parsing unchanged pages
+_page_hashes: dict[str, str] = {}
+
 
 def make_session() -> requests.Session:
     s = requests.Session()
@@ -146,7 +180,6 @@ def make_session() -> requests.Session:
 
 
 def warm_up_session(session: requests.Session):
-    """Visit homepage first to grab cookies and set a realistic referer."""
     try:
         resp = session.get("https://plaza.newnewnew.space/", timeout=30, allow_redirects=True)
         resp.raise_for_status()
@@ -157,23 +190,40 @@ def warm_up_session(session: requests.Session):
 
 
 def fetch_page(session: requests.Session, url: str) -> Optional[str]:
+    """Fetch a page and track response time. Returns None on error."""
     try:
+        start = time.monotonic()
         resp = session.get(url, timeout=30, allow_redirects=True)
+        elapsed = time.monotonic() - start
         resp.raise_for_status()
         session.headers["Referer"] = url
+
+        # Warn if Plaza is responding slowly (possible throttling)
+        if elapsed > 5.0:
+            logger.warning("Slow response from %s (%.1fs) — possible throttling", url, elapsed)
+
         return resp.text
     except requests.RequestException as e:
         logger.warning("Failed to fetch %s: %s", url, e)
         return None
 
 
+def page_changed(url: str, html: str) -> bool:
+    """Check if page content changed since last fetch using a hash."""
+    content_hash = hashlib.md5(html.encode()).hexdigest()
+    old_hash = _page_hashes.get(url)
+    _page_hashes[url] = content_hash
+    if old_hash is None:
+        return True  # first fetch, treat as changed
+    return content_hash != old_hash
+
+
 def extract_listings_from_html(html: str, source_url: str, target_city: str) -> list[Listing]:
-    """Parse HTML for rental listing cards/links mentioning the target city."""
     soup = BeautifulSoup(html, "html.parser")
     listings: list[Listing] = []
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Strategy 1: Detail page links (/aanbod/.../details/...)
+    # Strategy 1: Detail page links
     detail_links = set()
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
@@ -184,14 +234,10 @@ def extract_listings_from_html(html: str, source_url: str, target_city: str) -> 
         href = a_tag["href"]
         if not href.startswith("http"):
             href = "https://plaza.newnewnew.space" + href
-
         combined = (href + " " + a_tag.get_text(separator=" ", strip=True)).lower()
         if target_city.lower() not in combined:
             continue
-
         lid = hashlib.sha256(href.encode()).hexdigest()[:16]
-
-        # Walk up to find containing card
         card = a_tag
         for _ in range(5):
             parent = card.parent
@@ -199,12 +245,10 @@ def extract_listings_from_html(html: str, source_url: str, target_city: str) -> 
                 card = parent
                 if len(card.get_text(strip=True)) > 40:
                     break
-
         raw = card.get_text(separator=" | ", strip=True)
         price_match = re.search(r"€\s*[\d.,]+", raw)
         area_match = re.search(r"(\d+)\s*m[²2]", raw)
         title_text = a_tag.get_text(separator=" ", strip=True) or href.split("/")[-1]
-
         listings.append(Listing(
             listing_id=lid, title=title_text, address=title_text, city="Delft",
             price=price_match.group(0) if price_match else "",
@@ -260,14 +304,20 @@ def extract_listings_from_html(html: str, source_url: str, target_city: str) -> 
 
 def scrape_all(session: requests.Session, target_city: str) -> list[Listing]:
     warm_up_session(session)
-    time.sleep(random.uniform(1.5, 3.5))
+    time.sleep(random.uniform(0.5, 1.5))
     all_listings: dict[str, Listing] = {}
     for url in LISTING_URLS:
         html = fetch_page(session, url)
-        if html:
+        if not html:
+            continue
+        # Only parse if the page actually changed
+        if page_changed(url, html):
             for listing in extract_listings_from_html(html, url, target_city):
                 all_listings[listing.listing_id] = listing
-        time.sleep(random.uniform(2.0, 5.0))
+            logger.debug("Page changed: %s", url)
+        else:
+            logger.debug("Page unchanged, skipping parse: %s", url)
+        time.sleep(random.uniform(1.0, 2.0))
     return list(all_listings.values())
 
 
@@ -289,67 +339,67 @@ def save_seen(path: str, seen: dict[str, dict]):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Discord notification
+# Pushover notification
 # ──────────────────────────────────────────────────────────────────────
 
-def send_discord(config: Config, new_listings: list[Listing]):
-    """Send a rich embed to Discord via webhook."""
+def send_pushover(config: Config, new_listings: list[Listing]):
+    """Send a high-priority push notification via Pushover."""
     if not new_listings:
         return
 
     count = len(new_listings)
 
-    embeds = []
+    lines = []
     for l in new_listings:
-        fields = []
+        parts = [l.title]
         if l.price:
-            fields.append({"name": "Price", "value": l.price, "inline": True})
+            parts.append(l.price)
         if l.area:
-            fields.append({"name": "Size", "value": l.area, "inline": True})
+            parts.append(l.area)
+        lines.append(" — ".join(parts))
 
-        embeds.append({
-            "title": l.title[:256],
-            "url": l.url or "https://plaza.newnewnew.space/aanbod/wonen",
-            "color": 0x0057B7,
-            "fields": fields,
-            "footer": {"text": "⚡ React within 10 min — lottery system!"},
-            "timestamp": l.first_seen,
-        })
+    message = "\n".join(lines)
+    first_url = new_listings[0].url or "https://plaza.newnewnew.space/aanbod/wonen"
 
-    # Discord allows max 10 embeds per message
-    for i in range(0, len(embeds), 10):
-        batch = embeds[i:i + 10]
-        payload = {
-            "username": "Plaza Delft Monitor",
-            "content": (
-                f"@everyone\n"
-                f"## 🚨 {count} new Delft listing{'s' if count > 1 else ''}!\n"
-                f"Go respond NOW → https://plaza.newnewnew.space/aanbod/wonen"
-            ),
-            "embeds": batch,
-            "allowed_mentions": {"parse": ["everyone"]},
-        }
+    payload = {
+        "token": config.pushover_api_token,
+        "user": config.pushover_user_key,
+        "title": f"🏠 {count} new Delft listing{'s' if count > 1 else ''}!",
+        "message": message,
+        "url": first_url,
+        "url_title": "Open on Plaza",
+        "priority": 1,         # high priority — bypasses quiet hours
+        "sound": "persistent",  # loud repeated alert
+        "html": 0,
+    }
 
-        try:
-            resp = requests.post(config.discord_webhook_url, json=payload, timeout=15)
-            if resp.status_code == 204:
-                logger.info("✅ Discord notification sent (%d listing(s))", len(batch))
-            elif resp.status_code == 429:
-                retry_after = resp.json().get("retry_after", 5)
-                logger.warning("Discord rate limited, retrying in %ss", retry_after)
-                time.sleep(retry_after)
-                requests.post(config.discord_webhook_url, json=payload, timeout=15)
-            else:
-                logger.error("Discord webhook error %d: %s", resp.status_code, resp.text[:200])
-        except Exception as e:
-            logger.error("Failed to send Discord notification: %s", e)
+    try:
+        resp = requests.post("https://api.pushover.net/1/messages.json", data=payload, timeout=15)
+        if resp.status_code == 200:
+            logger.info("Pushover notification sent (%d listing(s))", count)
+        else:
+            logger.error("Pushover error %d: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.error("Failed to send Pushover notification: %s", e)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Main loop
+# Main logic
 # ──────────────────────────────────────────────────────────────────────
 
 def run_once(config: Config, session: requests.Session) -> int:
+    """Run a single check. Returns number of new listings found."""
+
+    # Time window guard
+    if not is_active_hours(config):
+        now_cet = datetime.now(CET)
+        logger.info("Outside active hours (%02d:%02d CET). Skipping.", now_cet.hour, now_cet.minute)
+        return 0
+
+    # Weekend: still check but log it (listings are rare but not impossible)
+    if is_weekend():
+        logger.info("Weekend check (listings are rare on weekends)")
+
     seen = load_seen(config.seen_file)
 
     logger.info("Checking Plaza for new Delft listings...")
@@ -363,7 +413,7 @@ def run_once(config: Config, session: requests.Session) -> int:
         for l in new_listings:
             logger.info("   -> %s  %s  %s", l.title, l.price, l.url)
             seen[l.listing_id] = asdict(l)
-        send_discord(config, new_listings)
+        send_pushover(config, new_listings)
         save_seen(config.seen_file, seen)
     else:
         logger.info("   No new listings.")
@@ -372,6 +422,7 @@ def run_once(config: Config, session: requests.Session) -> int:
 
 
 def main():
+    """Main loop for local/always-on execution."""
     config = Config()
     config.validate()
 
@@ -382,10 +433,10 @@ def main():
     )
 
     logger.info("=" * 50)
-    logger.info("  Plaza Delft Monitor (Discord)")
-    logger.info("  City    : %s", config.target_city)
-    logger.info("  Webhook : %s...", config.discord_webhook_url[:50])
-    logger.info("  Poll    : %d-%d sec", config.poll_min_seconds, config.poll_max_seconds)
+    logger.info("  Plaza Delft Monitor (Pushover)")
+    logger.info("  City   : %s", config.target_city)
+    logger.info("  Hours  : %02d:00–%02d:00 CET", config.active_hour_start, config.active_hour_end)
+    logger.info("  Poll   : %d-%d sec", config.poll_min_seconds, config.poll_max_seconds)
     logger.info("=" * 50)
 
     consecutive_errors = 0

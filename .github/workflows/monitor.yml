@@ -2,8 +2,8 @@ name: Plaza Delft Monitor
 
 on:
   schedule:
-    - cron: '*/10 * * * *'  # every 10 min
-  workflow_dispatch:         # manual trigger button
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   check-listings:
@@ -24,9 +24,14 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      # Random 0-120s jitter so checks land between 5-7 min apart
+      - name: Random jitter
+        run: sleep $((RANDOM % 121))
+
       - name: Run single check
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
           SEEN_FILE: "seen_listings.json"
         run: |
           python -c "
