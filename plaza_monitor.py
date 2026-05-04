@@ -322,10 +322,12 @@ def send_discord(config: Config, new_listings: list[Listing]):
         payload = {
             "username": "Plaza Delft Monitor",
             "content": (
+                f"@everyone\n"
                 f"## 🚨 {count} new Delft listing{'s' if count > 1 else ''}!\n"
                 f"Go respond NOW → https://plaza.newnewnew.space/aanbod/wonen"
             ),
             "embeds": batch,
+            "allowed_mentions": {"parse": ["everyone"]},
         }
 
         try:
