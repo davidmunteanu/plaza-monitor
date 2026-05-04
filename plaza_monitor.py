@@ -56,9 +56,8 @@ load_env_file()
 
 @dataclass
 class Config:
-    # Pushover credentials (REQUIRED)
-    pushover_user_key: str = os.getenv("PUSHOVER_USER_KEY", "")
-    pushover_api_token: str = os.getenv("PUSHOVER_API_TOKEN", "")
+    # Discord webhook URL (REQUIRED)
+    discord_webhook_url: str = os.getenv("DISCORD_WEBHOOK_URL", "")
 
     # Polling settings
     poll_min_seconds: int = int(os.getenv("POLL_MIN_SECONDS", "480"))
@@ -78,18 +77,12 @@ class Config:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
     def validate(self):
-        missing = []
-        if not self.pushover_user_key:
-            missing.append("PUSHOVER_USER_KEY")
-        if not self.pushover_api_token:
-            missing.append("PUSHOVER_API_TOKEN")
-        if missing:
+        if not self.discord_webhook_url:
             print(
-                f"\n❌  Missing: {', '.join(missing)}\n"
-                "   1. Install Pushover on your phone (Play Store)\n"
-                "   2. Your User Key is on the main screen of the app\n"
-                "   3. Create an app at https://pushover.net/apps/build to get an API Token\n"
-                "   4. Set both in .env or as GitHub secrets\n"
+                "\n❌  Missing DISCORD_WEBHOOK_URL\n"
+                "   1. In Discord: right-click a channel → Edit Channel → Integrations → Webhooks\n"
+                "   2. Click 'New Webhook', copy the URL\n"
+                "   3. Set it as a GitHub secret or in your .env file\n"
             )
             sys.exit(1)
 
@@ -339,48 +332,58 @@ def save_seen(path: str, seen: dict[str, dict]):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Pushover notification
+# Discord notification
 # ──────────────────────────────────────────────────────────────────────
 
-def send_pushover(config: Config, new_listings: list[Listing]):
-    """Send a high-priority push notification via Pushover."""
+def send_notification(config: Config, new_listings: list[Listing]):
+    """Send a rich embed to Discord via webhook with @everyone ping."""
     if not new_listings:
         return
 
     count = len(new_listings)
 
-    lines = []
+    embeds = []
     for l in new_listings:
-        parts = [l.title]
+        fields = []
         if l.price:
-            parts.append(l.price)
+            fields.append({"name": "Price", "value": l.price, "inline": True})
         if l.area:
-            parts.append(l.area)
-        lines.append(" — ".join(parts))
+            fields.append({"name": "Size", "value": l.area, "inline": True})
+        embeds.append({
+            "title": l.title[:256],
+            "url": l.url or "https://plaza.newnewnew.space/aanbod/wonen",
+            "color": 0x0057B7,
+            "fields": fields,
+            "footer": {"text": "⚡ React within 10 min — lottery system!"},
+            "timestamp": l.first_seen,
+        })
 
-    message = "\n".join(lines)
-    first_url = new_listings[0].url or "https://plaza.newnewnew.space/aanbod/wonen"
+    for i in range(0, len(embeds), 10):
+        batch = embeds[i:i + 10]
+        payload = {
+            "username": "Plaza Delft Monitor",
+            "content": (
+                f"@everyone\n"
+                f"## 🚨 {count} new Delft listing{'s' if count > 1 else ''}!\n"
+                f"Go respond NOW → https://plaza.newnewnew.space/aanbod/wonen"
+            ),
+            "allowed_mentions": {"parse": ["everyone"]},
+            "embeds": batch,
+        }
 
-    payload = {
-        "token": config.pushover_api_token,
-        "user": config.pushover_user_key,
-        "title": f"🏠 {count} new Delft listing{'s' if count > 1 else ''}!",
-        "message": message,
-        "url": first_url,
-        "url_title": "Open on Plaza",
-        "priority": 1,         # high priority — bypasses quiet hours
-        "sound": "persistent",  # loud repeated alert
-        "html": 0,
-    }
-
-    try:
-        resp = requests.post("https://api.pushover.net/1/messages.json", data=payload, timeout=15)
-        if resp.status_code == 200:
-            logger.info("Pushover notification sent (%d listing(s))", count)
-        else:
-            logger.error("Pushover error %d: %s", resp.status_code, resp.text[:200])
-    except Exception as e:
-        logger.error("Failed to send Pushover notification: %s", e)
+        try:
+            resp = requests.post(config.discord_webhook_url, json=payload, timeout=15)
+            if resp.status_code == 204:
+                logger.info("Discord notification sent (%d listing(s))", len(batch))
+            elif resp.status_code == 429:
+                retry_after = resp.json().get("retry_after", 5)
+                logger.warning("Discord rate limited, retrying in %ss", retry_after)
+                time.sleep(retry_after)
+                requests.post(config.discord_webhook_url, json=payload, timeout=15)
+            else:
+                logger.error("Discord webhook error %d: %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.error("Failed to send Discord notification: %s", e)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -413,7 +416,7 @@ def run_once(config: Config, session: requests.Session) -> int:
         for l in new_listings:
             logger.info("   -> %s  %s  %s", l.title, l.price, l.url)
             seen[l.listing_id] = asdict(l)
-        send_pushover(config, new_listings)
+        send_notification(config, new_listings)
         save_seen(config.seen_file, seen)
     else:
         logger.info("   No new listings.")
@@ -433,7 +436,7 @@ def main():
     )
 
     logger.info("=" * 50)
-    logger.info("  Plaza Delft Monitor (Pushover)")
+    logger.info("  Plaza Delft Monitor (Discord)")
     logger.info("  City   : %s", config.target_city)
     logger.info("  Hours  : %02d:00–%02d:00 CET", config.active_hour_start, config.active_hour_end)
     logger.info("  Poll   : %d-%d sec", config.poll_min_seconds, config.poll_max_seconds)
