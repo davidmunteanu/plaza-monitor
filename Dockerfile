@@ -9,10 +9,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy your script
 COPY plaza_monitor.py .
 
-# Create a blank JSON file just in case the volume mount is slow
+# Create a blank JSON file right next to the script
 RUN echo "{}" > seen_listings.json
 
-# Tell the script to save data to the Railway persistent volume
-ENV SEEN_FILE=/data/seen_listings.json
+# Tell the script to save data locally
+ENV SEEN_FILE=seen_listings.json
 
 CMD ["python", "plaza_monitor.py"]
